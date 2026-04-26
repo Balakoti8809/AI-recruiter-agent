@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Interview Portal - Talent Scout Studio</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <style>
+    .interview-portal {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 40px 20px;
+    }
+    
+    .welcome-card {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 40px;
+      border-radius: 16px;
+      text-align: center;
+      margin-bottom: 30px;
+    }
+    
+    .welcome-card h1 {
+      margin: 0 0 10px 0;
+      font-size: 2rem;
+    }
+    
+    .welcome-card .subtitle {
+      opacity: 0.9;
+      font-size: 1.1rem;
+    }
+    
+    .status-badge {
+      display: inline-block;
+      padding: 8px 20px;
+      border-radius: 20px;
+      font-weight: 600;
+      margin-top: 15px;
+    }
+    
+    .status-badge.pending { background: rgba(255,255,255,0.2); }
+    .status-badge.joined { background: #10b981; }
+    .status-badge.completed { background: #3b82f6; }
+    .status-badge.expired { background: #ef4444; }
+    
+    .interview-section {
+      background: var(--card-bg);
+      border-radius: 12px;
+      padding: 30px;
+      margin-bottom: 20px;
+      border: 1px solid var(--border-color);
+    }
+    
+    .interview-section h2 {
+      margin-top: 0;
+      color: var(--text-primary);
+    }
+    
+    .question-card {
+      background: var(--bg-secondary);
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 20px;
+      border-left: 4px solid #667eea;
+    }
+    
+    .question-card .question-number {
+      font-size: 0.85rem;
+      color: #667eea;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    
+    .question-card .question-text {
+      font-size: 1.1rem;
+      color: var(--text-primary);
+      margin-bottom: 15px;
+    }
+    
+    .answer-textarea {
+      width: 100%;
+      min-height: 120px;
+      padding: 15px;
+      border: 2px solid var(--border-color);
+      border-radius: 8px;
+      font-size: 1rem;
+      resize: vertical;
+      background: var(--input-bg);
+      color: var(--text-primary);
+      transition: border-color 0.2s;
+    }
+    
+    .answer-textarea:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+    
+    .submit-btn {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border: none;
+      padding: 12px 30px;
+      border-radius: 8px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    
+    .submit-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+    }
+    
+    .submit-btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none;
+    }
+    
+    .progress-bar {
+      background: var(--bg-secondary);
+      border-radius: 10px;
+      height: 8px;
+      margin: 20px 0;
+      overflow: hidden;
+    }
+    
+    .progress-fill {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      height: 100%;
+      border-radius: 10px;
+      transition: width 0.3s ease;
+    }
+    
+    .error-card {
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      border-radius: 12px;
+      padding: 30px;
+      text-align: center;
+    }
+    
+    .error-card h2 {
+      color: #dc2626;
+      margin-top: 0;
+    }
+    
+    .completed-card {
+      background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+      color: white;
+      border-radius: 16px;
+      padding: 40px;
+      text-align: center;
+    }
+    
+    .completed-card h2 {
+      margin-top: 0;
+    }
+    
+    .answer-history {
+      margin-top: 30px;
+    }
+    
+    .answer-item {
+      background: var(--bg-secondary);
+      border-radius: 8px;
+      padding: 15px;
+      margin-bottom: 15px;
+    }
+    
+    .answer-item .q {
+      font-weight: 600;
+      color: var(--text-primary);
+      margin-bottom: 8px;
+    }
+    
+    .answer-item .a {
+      color: var(--text-secondary);
+      padding-left: 15px;
+      border-left: 3px solid #667eea;
+    }
+    
+    .timer-warning {
+      background: #fef3c7;
+      border: 1px solid #fcd34d;
+      border-radius: 8px;
+      padding: 15px;
+      margin-bottom: 20px;
+      color: #92400e;
+    }
+    
+    .loading-spinner {
+      display: inline-block;
+      width: 20px;
+      height: 20px;
+      border: 3px solid rgba(255,255,255,0.3);
+      border-radius: 50%;
+      border-top-color: white;
+      animation: spin 1s ease-in-out infinite;
+    }
+    
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <div class="bg-orb bg-orb-a"></div>
+  <div class="bg-orb bg-orb-b"></div>
+
+  <div class="interview-portal">
+    <div id="loadingView">
+      <div class="welcome-card">
+        <h1>🎯 Starting Your AI Interview...</h1>
+        <p class="subtitle">You'll be connected with our AI interview bot</p>
+        <div class="loading-spinner" style="width: 40px; height: 40px; border-width: 4px; margin-top: 20px;"></div>
+        <p style="margin-top: 15px; opacity: 0.9; font-size: 0.95rem;">This will work best on your mobile phone</p>
+      </div>
+    </div>
+
+    <div id="errorView" style="display: none;">
+      <div class="error-card">
+        <h2>⚠️ Invalid or Expired Link</h2>
+        <p>This interview link is either invalid or has expired.</p>
+        <p style="margin-top: 15px; color: #666;">Please contact the recruiter for a new link.</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let meetingToken = null;
+    let meetingData = null;
+
+    async function init() {
+      // Extract token from URL
+      const pathParts = window.location.pathname.split('/');
+      meetingToken = pathParts[pathParts.length - 1];
+
+      if (!meetingToken) {
+        showError();
+        return;
+      }
+
+      try {
+        const response = await fetch(`/api/interview/validate/${meetingToken}`);
+        const data = await response.json();
+
+        if (!data.valid) {
+          showError();
+          return;
+        }
+
+        meetingData = data.meeting;
+        
+        // Mark as joined
+        await fetch(`/api/interview/join/${meetingToken}`, { method: 'POST' });
+        
+        // Redirect to interview studio with the meeting data
+        redirectToInterviewStudio(data);
+      } catch (error) {
+        console.error('Error validating token:', error);
+        showError();
+      }
+    }
+
+    function redirectToInterviewStudio(meetingData) {
+      // Extract run_id and candidate name from meeting data
+      const run_id = meetingData.meeting.run_id;
+      const candidate_name = meetingData.meeting.candidate_name;
+      
+      // Store meeting data in localStorage (more reliable than sessionStorage across redirects)
+      localStorage.setItem('meeting_token', meetingToken);
+      localStorage.setItem('meeting_run_id', run_id);
+      localStorage.setItem('meeting_candidate_name', candidate_name);
+      localStorage.setItem('interview_mode', 'meeting_portal');
+      
+      console.log('Meeting portal: Stored data and redirecting to interview studio', {
+        token: meetingToken,
+        run_id: run_id,
+        candidate_name: candidate_name
+      });
+      
+      // Redirect to main app with interview studio
+      // Add a query parameter to force reload if needed
+      window.location.href = `/?meeting_portal=true`;
+    }
+
+    function showError() {
+      document.getElementById('loadingView').style.display = 'none';
+      document.getElementById('errorView').style.display = 'block';
+    }
+
+    // Initialize on page load
+    init();
+  </script>
+</body>
+</html>

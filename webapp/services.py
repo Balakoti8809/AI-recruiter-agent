@@ -1,0 +1,612 @@
+"""Shared service helpers for the FastAPI web UI."""
+
+from __future__ import annotations
+
+from functools import lru_cache
+from io import BytesIO
+from pathlib import Path
+import re
+import sys
+import tempfile
+from typing import Dict, List, Tuple
+from uuid import uuid4
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+AGENT_DIR = ROOT_DIR / "agent"
+if str(AGENT_DIR) not in sys.path:
+    sys.path.insert(0, str(AGENT_DIR))
+
+from config import HF_TOKEN  # noqa: E402
+from hf_api_client import generate_text  # noqa: E402
+from interest_scorer import score_interest  # noqa: E402
+from json_utils import parse_json_from_text  # noqa: E402
+
+
+RESUME_PARSE_PROMPT = """
+Extract a structured candidate profile from the resume text below.
+
+Return ONLY valid JSON with exactly these keys:
+- name (string)
+- title (string)
+- years_exp (integer)
+- skills (list of strings)
+- summary (string)
+- current_company (string)
+- education (string)
+- openness (string: one of "very open", "somewhat open", "passive")
+
+Rules:
+- Use only information supported by the resume text when possible.
+- If something is unclear, make a conservative best effort.
+- If the resume does not state openness, default to "somewhat open".
+- Keep `summary` to 1 or 2 sentences.
+- Keep `skills` to the most relevant 6 to 12 skills.
+- `years_exp` must be a non-negative integer.
+
+Resume text:
+{resume_text}
+"""
+
+SKILL_HINTS = [
+    "python", "java", "javascript", "typescript", "react", "node", "node.js", "django",
+    "flask", "fastapi", "spring", "spring boot", "postgresql", "mysql", "mongodb",
+    "redis", "aws", "gcp", "azure", "docker", "kubernetes", "terraform", "sql",
+    "spark", "airflow", "dbt", "tableau", "power bi", "pytorch", "tensorflow",
+    "scikit-learn", "machine learning", "nlp", "rest", "graphql", "microservices",
+    "go", "golang", "rust", "c++", "c#", "linux", "git", "ci/cd"
+]
+
+MAX_REAL_INTERVIEW_CANDIDATE_TURNS = 4
+
+
+def clean_done_tokens(text: str) -> str:
+    """Remove control tokens from recruiter/candidate utterances."""
+    return (text or "").replace("RECRUITER_DONE", "").replace("CANDIDATE_DONE", "").strip()
+
+
+def count_candidate_turns(conversation: List[Dict]) -> int:
+    """Count how many times the human candidate has responded in the session."""
+    return sum(1 for message in conversation if message.get("speaker") == "candidate")
+
+
+def candidate_requested_interview_end(text: str) -> bool:
+    """Detect explicit signals that the candidate wants to end the interview now."""
+    lowered = clean_done_tokens(text).strip().lower()
+    end_markers = [
+        "end this interview",
+        "end the interview",
+        "stop the interview",
+        "let's end the interview",
+        "i want to end this interview",
+        "i want to stop",
+        "we can stop here",
+        "let's stop here",
+        "that's all from me",
+        "no more questions",
+        "move on to the next person",
+        "move to the next person",
+        "next candidate",
+    ]
+    return any(marker in lowered for marker in end_markers)
+
+
+def should_end_real_interview(conversation: List[Dict], latest_candidate_text: str) -> bool:
+    """End real interviews on explicit request or after a reasonable number of turns."""
+    if candidate_requested_interview_end(latest_candidate_text):
+        return True
+    return count_candidate_turns(conversation) >= MAX_REAL_INTERVIEW_CANDIDATE_TURNS
+
+
+def build_interview_closing(candidate_requested_end: bool) -> str:
+    """Create a short recruiter wrap-up when the interview ends outside model control."""
+    if candidate_requested_end:
+        return "Thanks for your time today. We can wrap up here, and I'll move on to the next candidate. RECRUITER_DONE"
+    return "Thanks, this gives me enough to wrap up the interview for now. I'll move on to the next candidate. RECRUITER_DONE"
+
+
+def _looks_like_candidate_answer(text: str) -> bool:
+    """Detect when the interviewer accidentally responds like the candidate."""
+    lowered = clean_done_tokens(text).strip().lower()
+    candidate_markers = [
+        "i am",
+        "i'm",
+        "my experience",
+        "i have worked",
+        "i worked",
+        "i have been",
+        "i'm currently",
+        "my background",
+        "i would be interested",
+        "thank you for having me",
+    ]
+    return any(marker in lowered for marker in candidate_markers) and "?" not in lowered
+
+
+def generate_recruiter_question(jd_parsed: Dict, conversation: List[Dict], candidate: Dict | None = None) -> str:
+    """Generate one recruiter turn for real interview mode."""
+    candidate_name = (candidate or {}).get("name", "the candidate")
+    candidate_title = (candidate or {}).get("title", "their current role")
+    required_skills = ", ".join(jd_parsed.get("required_skills", [])[:6]) or "the core skills for this role"
+    
+    # Count turns and extract covered topics
+    turn_count = count_candidate_turns(conversation)
+    
+    # Build conversation history with clear speaker labels
+    history_lines = []
+    for msg in conversation:
+        speaker = "RECRUITER" if msg.get("speaker") == "recruiter" else "CANDIDATE"
+        text = clean_done_tokens(msg.get("text", ""))
+        history_lines.append(f"{speaker}: {text}")
+    conversation_history = "\n".join(history_lines)
+    
+    # Determine what topics have been covered based on conversation content
+    covered_topics = []
+    history_lower = conversation_history.lower()
+    if any(word in history_lower for word in ["welcome", "glad", "thanks for joining", "pleasure"]):
+        covered_topics.append("welcome/greeting")
+    if any(word in history_lower for word in ["current role", "currently doing", "your role", "position"]):
+        covered_topics.append("current role")
+    if any(word in history_lower for word in ["experience", "worked with", "years", "background in"]):
+        covered_topics.append("experience")
+    if any(word in history_lower for word in ["why", "interested", "attracted", "motivated", "this role"]):
+        covered_topics.append("motivation")
+    if any(word in history_lower for word in ["available", "availability", "notice", "start", "when can"]):
+        covered_topics.append("availability")
+    if any(word in history_lower for word in ["salary", "compensation", "expectation", "pay"]):
+        covered_topics.append("salary")
+    
+    covered_topics_str = ", ".join(covered_topics) if covered_topics else "None yet"
+    
+    # Determine next topic to ask about
+    next_topic_hints = []
+    if "welcome/greeting" not in covered_topics and turn_count == 0:
+        next_topic_hints.append("Start with a warm welcome and ask about their current situation")
+    if "experience" not in covered_topics and turn_count >= 1:
+        next_topic_hints.append("Ask about their experience with the required skills")
+    if "motivation" not in covered_topics and turn_count >= 2:
+        next_topic_hints.append("Ask why they're interested in this specific role")
+    if "availability" not in covered_topics and turn_count >= 3:
+        next_topic_hints.append("Ask about their availability or notice period")
+    if turn_count >= 4:
+        next_topic_hints.append("Wrap up the interview with RECRUITER_DONE")
+    
+    next_topic = next_topic_hints[0] if next_topic_hints else "Continue naturally"
+    
+    prompt = f"""You are a recruiter conducting a live interview. You MUST NOT repeat questions.
+
+INTERVIEW CONTEXT:
+- Candidate: {candidate_name} ({candidate_title})
+- Role: {jd_parsed.get("role", "this role")}
+- Required Skills: {required_skills}
+- Turn Number: {turn_count + 1}
+
+TOPICS ALREADY COVERED: {covered_topics_str}
+
+NEXT TOPIC TO ASK ABOUT: {next_topic}
+
+CRITICAL RULES:
+1. Read the conversation history below carefully
+2. NEVER ask about topics already covered
+3. Ask exactly ONE question per turn
+4. Keep responses to 1-2 sentences
+5. Acknowledge the candidate's last answer briefly, then ask your next question
+6. After 4-5 candidate turns, wrap up with "RECRUITER_DONE"
+7. Do NOT repeat any question from the history
+
+CONVERSATION HISTORY:
+{conversation_history if conversation_history else "(This is the first turn - welcome the candidate)"}
+
+YOUR RESPONSE (as the recruiter):"""
+
+    content = generate_text(prompt, model="interview", max_length=300, temperature=0.8)
+
+    if _looks_like_candidate_answer(content):
+        retry_prompt = f"{prompt}\n\nIMPORTANT: Your last response sounded like the candidate speaking. You are the RECRUITER. Ask a question TO the candidate. Try again:"
+        content = generate_text(retry_prompt, model="interview", max_length=300)
+
+    return content
+
+
+def _clean_resume_text(text: str) -> str:
+    lines = [line.strip() for line in (text or "").splitlines()]
+    cleaned = [line for line in lines if line]
+    return "\n".join(cleaned)
+
+
+def _extract_name_from_resume_text(resume_text: str) -> str | None:
+    """Extract candidate name from resume content, not filename."""
+    if not resume_text:
+        return None
+    
+    lines = [line.strip() for line in resume_text.splitlines() if line.strip()]
+    if not lines:
+        return None
+    
+    # Common patterns to look for
+    name_patterns = [
+        r"^(?:name|full name|candidate name)\s*[:\-]?\s*(.+)$",  # Name: John Doe
+        r"^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)$",  # John Doe (capitalized words)
+    ]
+    
+    # Check first 5 lines for name patterns
+    for line in lines[:5]:
+        # Check for explicit "Name:" pattern
+        for pattern in name_patterns:
+            match = re.match(pattern, line, re.IGNORECASE)
+            if match:
+                name = match.group(1).strip()
+                # Validate it looks like a name (2-4 words, no numbers, no special chars)
+                words = name.split()
+                if 2 <= len(words) <= 4 and not any(char.isdigit() for char in name):
+                    # Check each word starts with capital
+                    if all(w[0].isupper() or w[0].isalpha() for w in words if w):
+                        return name
+    
+    # Fallback: Check if first line looks like a name
+    first_line = lines[0]
+    words = first_line.split()
+    # A name typically has 2-4 words, starts with capital, no numbers/special chars
+    if (
+        2 <= len(words) <= 4
+        and all(word[0].isupper() for word in words if word)
+        and not any(char.isdigit() for char in first_line)
+        and not any(char in first_line for char in ['@', '#', '$', '%', '&', '*', '(', ')'])
+        and not any(word.lower() in ['cv', 'resume', 'curriculum', 'vitae', 'profile', 'email', 'phone', 'address', 'linkedin', 'github'] for word in words)
+    ):
+        return first_line
+    
+    return None
+
+
+def _guess_name_from_filename(filename: str) -> str:
+    """Extract a clean name from filename, removing numbers, parentheses, and special chars."""
+    stem = Path(filename or "Candidate").stem
+    # Remove numbers in parentheses like (1), (7), etc.
+    stem = re.sub(r"\(\d+\)", "", stem)
+    # Remove other numbers
+    stem = re.sub(r"\d+", "", stem)
+    # Replace underscores and hyphens with spaces
+    stem = re.sub(r"[_\-]+", " ", stem).strip()
+    # Remove common file naming patterns
+    stem = re.sub(r"\b(cv|resume|curriculum vitae)\b", "", stem, flags=re.IGNORECASE).strip()
+    # Capitalize words
+    words = [word.capitalize() for word in stem.split() if word and len(word) > 1]
+    return " ".join(words[:4]) or "Candidate"
+
+
+def _fallback_years_exp(text: str) -> int:
+    patterns = [
+        r"(\d{1,2})\+?\s+years(?:\s+of)?\s+experience",
+        r"experience\s*[:\-]?\s*(\d{1,2})\+?\s+years",
+    ]
+    lowered = text.lower()
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if match:
+            return max(0, int(match.group(1)))
+    return 0
+
+
+def _fallback_skills(text: str) -> List[str]:
+    lowered = text.lower()
+    skills = []
+    seen = set()
+    for skill in SKILL_HINTS:
+        if skill in lowered and skill not in seen:
+            seen.add(skill)
+            if skill == "node.js":
+                skills.append("Node.js")
+            elif skill == "ci/cd":
+                skills.append("CI/CD")
+            else:
+                skills.append(skill.title())
+    return skills[:12]
+
+
+def _fallback_candidate_from_text(resume_text: str, filename: str) -> Dict:
+    """Extract candidate info from resume text, prioritizing content over filename."""
+    lines = [line.strip() for line in resume_text.splitlines() if line.strip()]
+    
+    # Try to extract name from resume content first
+    name = _extract_name_from_resume_text(resume_text)
+    if not name:
+        # Only fall back to filename if we can't find name in content
+        name = _guess_name_from_filename(filename)
+    
+    # Try to extract title from second line (common pattern)
+    title = "Candidate"
+    if len(lines) > 1:
+        second_line = lines[1]
+        # Title is usually a short line (job title) after the name
+        if len(second_line) <= 80 and not any(char.isdigit() for char in second_line[:10]):
+            # Check if it looks like a job title (not email, phone, etc.)
+            if not any(word in second_line.lower() for word in ['@', 'email', 'phone', 'linkedin', 'github', 'address', 'www', 'http']):
+                title = second_line
+
+    return {
+        "id": f"resume-{uuid4().hex[:8]}",
+        "name": name,
+        "title": title,
+        "years_exp": _fallback_years_exp(resume_text),
+        "skills": _fallback_skills(resume_text),
+        "summary": "Resume uploaded and partially parsed from PDF text.",
+        "current_company": "Unknown",
+        "education": "Not provided",
+        "openness": "somewhat open",
+        "source_filename": filename,
+        "resume_text": resume_text,
+    }
+
+
+def _is_valid_name(name: str) -> bool:
+    """Check if a name looks like a real person's name, not a filename or garbage."""
+    if not name or len(name) < 3:
+        return False
+    
+    # Names should not contain these patterns
+    invalid_patterns = [
+        r'\d',  # Numbers
+        r'[(){}[\]]',  # Brackets
+        r'[._\-]',  # Underscores, dots, hyphens (common in filenames)
+        r'@',  # Email
+        r'cv\b', r'resume\b', r'curriculum', r'vitae',  # CV-related words
+        r'www', r'http', r'linkedin', r'github',  # URLs
+    ]
+    
+    lowered = name.lower()
+    for pattern in invalid_patterns:
+        if re.search(pattern, lowered, re.IGNORECASE):
+            return False
+    
+    # Name should have 2-4 words
+    words = name.split()
+    if not (2 <= len(words) <= 4):
+        return False
+    
+    # Each word should start with a letter
+    for word in words:
+        if not word or not word[0].isalpha():
+            return False
+    
+    return True
+
+
+def normalize_candidate_profile(profile: Dict, filename: str, resume_text: str) -> Dict:
+    """Normalize parsed resume data into the candidate schema used by the pipeline."""
+    skills = profile.get("skills", [])
+    if not isinstance(skills, list):
+        skills = []
+    normalized_skills = []
+    seen = set()
+    for skill in skills:
+        skill_text = str(skill).strip()
+        lowered = skill_text.lower()
+        if skill_text and lowered not in seen:
+            seen.add(lowered)
+            normalized_skills.append(skill_text)
+
+    openness = str(profile.get("openness") or "somewhat open").strip().lower()
+    if openness not in {"very open", "somewhat open", "passive"}:
+        openness = "somewhat open"
+
+    years_exp_raw = profile.get("years_exp", 0)
+    try:
+        years_exp = max(0, int(float(years_exp_raw)))
+    except (TypeError, ValueError):
+        years_exp = _fallback_years_exp(resume_text)
+
+    # Priority for name: 1) Valid parsed name, 2) Name from resume text, 3) Cleaned filename
+    parsed_name = str(profile.get("name") or "").strip()
+    if _is_valid_name(parsed_name):
+        name = parsed_name
+    else:
+        # Try to extract from resume content
+        extracted_name = _extract_name_from_resume_text(resume_text)
+        if extracted_name:
+            name = extracted_name
+        else:
+            # Last resort: use cleaned filename
+            name = _guess_name_from_filename(filename)
+
+    candidate = {
+        "id": str(profile.get("id") or f"resume-{uuid4().hex[:8]}"),
+        "name": name,
+        "title": str(profile.get("title") or "Candidate").strip(),
+        "years_exp": years_exp,
+        "skills": normalized_skills or _fallback_skills(resume_text) or ["Generalist"],
+        "summary": str(profile.get("summary") or "Resume uploaded from PDF.").strip(),
+        "openness": openness,
+        "current_company": str(profile.get("current_company") or "Unknown").strip(),
+        "education": str(profile.get("education") or "Not provided").strip(),
+        "source_filename": filename,
+        "resume_text": resume_text,
+    }
+    return candidate
+
+
+def extract_text_from_pdf(file_bytes: bytes) -> Tuple[str, str]:
+    """Extract text from a PDF byte stream."""
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return "", "PDF parsing dependency is missing. Install with: pip install pypdf"
+
+    try:
+        reader = PdfReader(BytesIO(file_bytes))
+        text_parts = []
+        for page in reader.pages:
+            text_parts.append(page.extract_text() or "")
+        text = _clean_resume_text("\n".join(text_parts))
+        if not text:
+            return "", "Could not extract text from this PDF. It may be scanned or image-only."
+        return text, ""
+    except Exception as exc:
+        return "", f"Failed to read PDF: {exc}"
+
+
+def parse_resume_to_candidate(resume_text: str, filename: str) -> Tuple[Dict, str]:
+    """Convert extracted resume text into the candidate schema used by the matcher."""
+    cleaned_text = _clean_resume_text(resume_text)
+    if not cleaned_text:
+        return {}, "Resume text is empty after extraction."
+
+    prompt = RESUME_PARSE_PROMPT.format(resume_text=cleaned_text[:12000])
+    try:
+        response_text = generate_text(prompt, max_length=800)
+        parsed = parse_json_from_text(response_text)
+        return normalize_candidate_profile(parsed, filename, cleaned_text), ""
+    except Exception:
+        # Fall back to a heuristic parser so resume upload still works if the model output is noisy.
+        return _fallback_candidate_from_text(cleaned_text, filename), ""
+
+
+def extract_candidates_from_resumes(files: List[Tuple[str, bytes]]) -> Tuple[List[Dict], List[Dict]]:
+    """Extract and parse uploaded PDF resumes into candidate profiles."""
+    candidates: List[Dict] = []
+    errors: List[Dict] = []
+
+    for filename, file_bytes in files:
+        resume_text, extract_error = extract_text_from_pdf(file_bytes)
+        if extract_error:
+            errors.append({"filename": filename, "error": extract_error})
+            continue
+
+        candidate, parse_error = parse_resume_to_candidate(resume_text, filename)
+        if parse_error:
+            errors.append({"filename": filename, "error": parse_error})
+            continue
+
+        candidates.append(candidate)
+
+    return candidates, errors
+
+
+def get_candidate(results: Dict, candidate_name: str) -> Dict | None:
+    """Find candidate by name inside results payload."""
+    for candidate in results.get("ranked_candidates", []):
+        if candidate.get("name") == candidate_name:
+            return candidate
+    return None
+
+
+def rerank_real_candidates(results: Dict) -> None:
+    """Sort real-mode candidates by combined score after updates."""
+    results["ranked_candidates"] = sorted(
+        results.get("ranked_candidates", []),
+        key=lambda item: item.get("combined_score", 0),
+        reverse=True
+    )
+
+
+def reset_candidate_real_state(results: Dict, candidate_name: str) -> None:
+    """Reset one candidate's interview state in real mode."""
+    candidate = get_candidate(results, candidate_name)
+    if not candidate:
+        return
+
+    candidate["conversation"] = []
+    candidate["interest_score"] = 0.0
+    candidate["availability"] = "Pending real interview"
+    candidate["key_signals"] = []
+    candidate["red_flags"] = []
+    candidate["combined_score"] = round(float(candidate.get("match_score", 0)), 1)
+    rerank_real_candidates(results)
+
+
+def update_candidate_from_real_interview(
+    results: Dict,
+    candidate_name: str,
+    conversation: List[Dict]
+) -> Dict:
+    """Score interest from human interview and update one candidate in results."""
+    interest_result = score_interest(conversation)
+
+    candidate = get_candidate(results, candidate_name)
+    if not candidate:
+        raise ValueError(f"Candidate not found: {candidate_name}")
+
+    candidate["conversation"] = conversation
+    candidate["interest_score"] = float(interest_result.get("interest_score", 0))
+    candidate["availability"] = interest_result.get("availability", "Unknown")
+    candidate["key_signals"] = interest_result.get("key_signals", [])
+    candidate["red_flags"] = interest_result.get("red_flags", [])
+    candidate["combined_score"] = round(
+        float(candidate.get("match_score", 0)) * 0.60 + float(candidate.get("interest_score", 0)) * 0.40,
+        1
+    )
+    rerank_real_candidates(results)
+    return interest_result
+
+
+def apply_early_exit_signal(results: Dict, candidate_name: str) -> Dict | None:
+    """Mark an interview that ended early as a cautionary signal on the candidate profile."""
+    candidate = get_candidate(results, candidate_name)
+    if not candidate:
+        return None
+
+    red_flags = list(candidate.get("red_flags", []))
+    key_signals = list(candidate.get("key_signals", []))
+
+    early_exit_flag = "Candidate asked to end the interview early."
+    if early_exit_flag not in red_flags:
+        red_flags.append(early_exit_flag)
+
+    early_exit_signal = "Candidate ended the conversation before the interview fully played out."
+    if early_exit_signal not in key_signals:
+        key_signals.append(early_exit_signal)
+
+    candidate["red_flags"] = red_flags
+    candidate["key_signals"] = key_signals
+    candidate["availability"] = candidate.get("availability") or "passive"
+    candidate["interest_score"] = min(float(candidate.get("interest_score", 0)), 25.0)
+    candidate["combined_score"] = round(
+        float(candidate.get("match_score", 0)) * 0.60 + float(candidate.get("interest_score", 0)) * 0.40,
+        1
+    )
+    rerank_real_candidates(results)
+    return candidate
+
+
+@lru_cache(maxsize=3)
+def load_whisper_model(model_name: str):
+    """Lazy-load and cache whisper model by name."""
+    import whisper
+
+    return whisper.load_model(model_name)
+
+
+def transcribe_uploaded_audio(file_bytes: bytes, suffix: str, model_name: str = "tiny") -> Tuple[str, str]:
+    """
+    Transcribe uploaded audio bytes with whisper.
+    Returns (transcript, error).
+    """
+    tmp_path = ""
+    try:
+        model = load_whisper_model(model_name)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".wav") as tmp_file:
+            tmp_file.write(file_bytes)
+            tmp_path = tmp_file.name
+
+        result = model.transcribe(
+            tmp_path,
+            fp16=False,
+            temperature=0,
+            best_of=1,
+            beam_size=1,
+            language="en",
+            condition_on_previous_text=False
+        )
+        transcript = (result.get("text") or "").strip()
+        if not transcript:
+            return "", "Could not detect speech in audio."
+        return transcript, ""
+    except ImportError:
+        return "", "Whisper is not installed. Install with: pip install openai-whisper"
+    except Exception as exc:
+        return "", f"Voice transcription failed: {str(exc)}"
+    finally:
+        if tmp_path:
+            try:
+                Path(tmp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
